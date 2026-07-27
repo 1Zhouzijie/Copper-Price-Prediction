@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "copper-price-prediction"
+version = "0.1.0"
+description = "CNN and three-GAE model for copper interval price prediction."
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "torch>=2.2",
+    "akshare>=1.18",
+    "yfinance>=0.2",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
