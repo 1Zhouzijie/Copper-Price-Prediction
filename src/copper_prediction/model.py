@@ -436,20 +436,84 @@ class CopperIntervalPredictor(nn.Module):
         return prediction, aux
 
 
-def interval_prediction_loss(prediction: Tensor, target: Tensor, bound_weight: float = 1.0) -> Tensor:
-    """MSE loss plus a penalty when predicted low is above predicted high."""
+def interval_prediction_loss_components(
+    prediction: Tensor,
+    target: Tensor,
+    bound_penalty_weight: float = 1.0,
+) -> dict[str, Tensor]:
+    """Return the supervised interval-loss components separately."""
 
     mse = F.mse_loss(prediction, target)
     low = prediction[:, 0]
     high = prediction[:, 1]
     bound_penalty = F.relu(low - high).pow(2).mean()
-    return mse + bound_weight * bound_penalty
+    supervised = mse + bound_penalty_weight * bound_penalty
+    return {
+        "mse_loss": mse,
+        "bound_penalty_loss": bound_penalty,
+        "supervised_loss": supervised,
+    }
+
+
+def interval_prediction_loss(
+    prediction: Tensor,
+    target: Tensor,
+    bound_weight: float = 1.0,
+) -> Tensor:
+    """MSE loss plus a penalty when predicted low is above predicted high."""
+
+    return interval_prediction_loss_components(
+        prediction,
+        target,
+        bound_penalty_weight=bound_weight,
+    )["supervised_loss"]
 
 
 def gae_reconstruction_loss(reconstruction: Tensor, adjacency: Tensor) -> Tensor:
     """Reconstruction loss for one GAE branch."""
 
     return F.mse_loss(reconstruction, adjacency.clamp(0.0, 1.0))
+
+
+def training_loss_components(
+    prediction: Tensor,
+    target: Tensor,
+    aux: dict[str, Tensor],
+    market_adj: Tensor,
+    demand_adj: Tensor,
+    supply_adj: Tensor,
+    supervised_weight: float = 1.0,
+    bound_penalty_weight: float = 1.0,
+    reconstruction_weight: float = 5e-4,
+) -> dict[str, Tensor]:
+    """Return weighted total loss and every raw component used to build it."""
+
+    interval = interval_prediction_loss_components(
+        prediction,
+        target,
+        bound_penalty_weight=bound_penalty_weight,
+    )
+    market_reconstruction = gae_reconstruction_loss(aux["a_market_hat"], market_adj)
+    demand_reconstruction = gae_reconstruction_loss(aux["a_demand_hat"], demand_adj)
+    supply_reconstruction = gae_reconstruction_loss(aux["a_supply_hat"], supply_adj)
+    reconstruction = (
+        market_reconstruction
+        + demand_reconstruction
+        + supply_reconstruction
+    ) / 3.0
+    weighted_supervised = supervised_weight * interval["supervised_loss"]
+    weighted_reconstruction = reconstruction_weight * reconstruction
+    total = weighted_supervised + weighted_reconstruction
+    return {
+        "total_loss": total,
+        **interval,
+        "market_reconstruction_loss": market_reconstruction,
+        "demand_reconstruction_loss": demand_reconstruction,
+        "supply_reconstruction_loss": supply_reconstruction,
+        "reconstruction_loss": reconstruction,
+        "weighted_supervised_loss": weighted_supervised,
+        "weighted_reconstruction_loss": weighted_reconstruction,
+    }
 
 
 def total_training_loss(
@@ -459,15 +523,28 @@ def total_training_loss(
     market_adj: Tensor,
     demand_adj: Tensor,
     supply_adj: Tensor,
-    interval_weight: float = 1.0,
-    reconstruction_weight: float = 0.1,
+    interval_weight: float | None = None,
+    reconstruction_weight: float = 5e-4,
+    supervised_weight: float = 1.0,
+    bound_penalty_weight: float = 1.0,
 ) -> Tensor:
-    """Combined supervised interval loss and unsupervised graph reconstruction loss."""
+    """Return the combined supervised and graph-reconstruction loss.
 
-    supervised = interval_prediction_loss(prediction, target, bound_weight=interval_weight)
-    reconstruction = (
-        gae_reconstruction_loss(aux["a_market_hat"], market_adj)
-        + gae_reconstruction_loss(aux["a_demand_hat"], demand_adj)
-        + gae_reconstruction_loss(aux["a_supply_hat"], supply_adj)
-    ) / 3.0
-    return supervised + reconstruction_weight * reconstruction
+    ``interval_weight`` is retained as a backward-compatible alias for the old
+    bound-penalty weight. New code should use ``bound_penalty_weight`` so the
+    role of each weight is explicit.
+    """
+
+    if interval_weight is not None:
+        bound_penalty_weight = interval_weight
+    return training_loss_components(
+        prediction=prediction,
+        target=target,
+        aux=aux,
+        market_adj=market_adj,
+        demand_adj=demand_adj,
+        supply_adj=supply_adj,
+        supervised_weight=supervised_weight,
+        bound_penalty_weight=bound_penalty_weight,
+        reconstruction_weight=reconstruction_weight,
+    )["total_loss"]

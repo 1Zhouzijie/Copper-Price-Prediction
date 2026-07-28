@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+import json
 from pathlib import Path
 import random
 import sys
@@ -27,7 +28,20 @@ from copper_prediction.io import load_asset_frames  # noqa: E402
 from copper_prediction.model import (  # noqa: E402
     CopperIntervalPredictor,
     CopperIntervalPredictorConfig,
-    total_training_loss,
+    training_loss_components,
+)
+
+LOSS_METRIC_KEYS = (
+    "total_loss",
+    "supervised_loss",
+    "mse_loss",
+    "bound_penalty_loss",
+    "reconstruction_loss",
+    "market_reconstruction_loss",
+    "demand_reconstruction_loss",
+    "supply_reconstruction_loss",
+    "weighted_supervised_loss",
+    "weighted_reconstruction_loss",
 )
 
 
@@ -44,8 +58,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--start-date", default=None, help="Optional first sample date, e.g. 20230302.")
     parser.add_argument("--end-date", default=None, help="Optional last sample date, e.g. 20251117.")
-    parser.add_argument("--reconstruction-weight", type=float, default=0.1)
-    parser.add_argument("--interval-weight", type=float, default=1.0)
+    parser.add_argument("--supervised-weight", type=float, default=1.0)
+    parser.add_argument("--bound-penalty-weight", type=float, default=1.0)
+    parser.add_argument("--reconstruction-weight", type=float, default=5e-4)
+    parser.add_argument(
+        "--interval-weight",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--selection-metric",
+        choices=["mae", "supervised_loss", "total_loss"],
+        default="mae",
+        help="Validation metric used to select best_model.pt.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=12,
+        help="Stop after this many epochs without validation improvement; 0 disables.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=1e-6,
+        help="Minimum validation-metric decrease counted as an improvement.",
+    )
     parser.add_argument("--graph-encoder", choices=["gcn", "gat"], default="gcn")
     parser.add_argument("--gat-heads", type=int, default=4)
     parser.add_argument("--gat-attention-dropout", type=float, default=0.1)
@@ -150,12 +189,57 @@ def move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return moved
 
 
+def validate_training_args(args: argparse.Namespace) -> None:
+    nonnegative_weights = {
+        "--supervised-weight": args.supervised_weight,
+        "--bound-penalty-weight": args.bound_penalty_weight,
+        "--reconstruction-weight": args.reconstruction_weight,
+    }
+    for name, value in nonnegative_weights.items():
+        if value < 0:
+            raise ValueError(f"{name} must be nonnegative")
+    if args.epochs < 1:
+        raise ValueError("--epochs must be at least 1")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
+    if args.early_stopping_patience < 0:
+        raise ValueError("--early-stopping-patience must be nonnegative")
+    if args.early_stopping_min_delta < 0:
+        raise ValueError("--early-stopping-min-delta must be nonnegative")
+
+
+def serializable_args(args: argparse.Namespace) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for key, value in vars(args).items():
+        values[key] = str(value) if isinstance(value, Path) else value
+    return values
+
+
+def date_range_metadata(dates: list[pd.Timestamp]) -> dict[str, Any]:
+    if not dates:
+        return {"samples": 0, "start": None, "end": None}
+    return {
+        "samples": len(dates),
+        "start": str(dates[0].date()),
+        "end": str(dates[-1].date()),
+    }
+
+
+def save_run_config(path: Path, run_config: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(run_config, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 def forward_loss(
     model: CopperIntervalPredictor,
     batch: dict[str, Any],
-    interval_weight: float,
+    supervised_weight: float,
+    bound_penalty_weight: float,
     reconstruction_weight: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
     prediction, aux = model(
         cnn_x=batch["cnn_x"],
         market_x=batch["market_x"],
@@ -166,59 +250,86 @@ def forward_loss(
         supply_adj=batch["supply_adj"],
         return_aux=True,
     )
-    loss = total_training_loss(
+    components = training_loss_components(
         prediction=prediction,
         target=batch["target"],
         aux=aux,
         market_adj=batch["market_adj"],
         demand_adj=batch["demand_adj"],
         supply_adj=batch["supply_adj"],
-        interval_weight=interval_weight,
+        supervised_weight=supervised_weight,
+        bound_penalty_weight=bound_penalty_weight,
         reconstruction_weight=reconstruction_weight,
     )
-    return loss, prediction
+    return components, prediction
 
 
 def run_epoch(
     model: CopperIntervalPredictor,
     loader: DataLoader,
     device: torch.device,
-    interval_weight: float,
+    supervised_weight: float,
+    bound_penalty_weight: float,
     reconstruction_weight: float,
     optimizer: torch.optim.Optimizer | None = None,
-) -> tuple[float, float]:
+) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
-    total_loss = 0.0
-    total_mae = 0.0
+    metric_totals = {key: 0.0 for key in LOSS_METRIC_KEYS}
+    metric_totals.update(
+        {
+            "mae": 0.0,
+            "low_mae": 0.0,
+            "high_mae": 0.0,
+            "order_violation_rate": 0.0,
+        }
+    )
     total_count = 0
 
     for raw_batch in loader:
         batch = move_batch(raw_batch, device)
         with torch.set_grad_enabled(training):
-            loss, prediction = forward_loss(model, batch, interval_weight, reconstruction_weight)
+            components, prediction = forward_loss(
+                model,
+                batch,
+                supervised_weight,
+                bound_penalty_weight,
+                reconstruction_weight,
+            )
             if training:
-                optimizer.zero_grad()
-                loss.backward()
+                optimizer.zero_grad(set_to_none=True)
+                components["total_loss"].backward()
                 optimizer.step()
 
         batch_size = int(batch["target"].shape[0])
-        total_loss += float(loss.detach().cpu()) * batch_size
-        total_mae += float(torch.mean(torch.abs(prediction.detach() - batch["target"])).cpu()) * batch_size
+        for key in LOSS_METRIC_KEYS:
+            metric_totals[key] += float(components[key].detach().cpu()) * batch_size
+
+        absolute_error = torch.abs(prediction.detach() - batch["target"])
+        metric_totals["mae"] += float(absolute_error.mean().cpu()) * batch_size
+        metric_totals["low_mae"] += float(absolute_error[:, 0].mean().cpu()) * batch_size
+        metric_totals["high_mae"] += float(absolute_error[:, 1].mean().cpu()) * batch_size
+        metric_totals["order_violation_rate"] += (
+            float((prediction.detach()[:, 0] > prediction.detach()[:, 1]).float().mean().cpu())
+            * batch_size
+        )
         total_count += batch_size
 
     if total_count == 0:
-        return float("nan"), float("nan")
-    return total_loss / total_count, total_mae / total_count
+        return {key: float("nan") for key in metric_totals}
+    return {key: value / total_count for key, value in metric_totals.items()}
 
 
 def save_checkpoint(
     path: Path,
     model: CopperIntervalPredictor,
     epoch: int,
-    train_loss: float,
-    val_loss: float,
-    test_loss: float | None = None,
+    train_metrics: dict[str, float],
+    val_metrics: dict[str, float],
+    selection_metric: str,
+    selection_value: float,
+    run_config: dict[str, Any],
+    test_metrics: dict[str, float] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -226,16 +337,67 @@ def save_checkpoint(
             "model_state_dict": model.state_dict(),
             "config": asdict(model.config),
             "epoch": epoch,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "test_loss": test_loss,
+            "train_loss": train_metrics["total_loss"],
+            "val_loss": val_metrics["total_loss"],
+            "test_loss": None if test_metrics is None else test_metrics["total_loss"],
+            "train_metrics": train_metrics,
+            "val_metrics": val_metrics,
+            "test_metrics": test_metrics,
+            "selection_metric": selection_metric,
+            "selection_value": selection_value,
+            "run_config": run_config,
         },
         path,
     )
 
 
+def history_row(
+    epoch: int,
+    train_metrics: dict[str, float],
+    val_metrics: dict[str, float],
+    selection_metric: str,
+    selection_value: float,
+    improved: bool,
+) -> dict[str, float | int | bool | str]:
+    row: dict[str, float | int | bool | str] = {
+        "epoch": epoch,
+        "selection_metric": selection_metric,
+        "selection_value": selection_value,
+        "is_best": improved,
+    }
+    for prefix, metrics in (("train", train_metrics), ("val", val_metrics)):
+        for key, value in metrics.items():
+            row[f"{prefix}_{key}"] = value
+    return row
+
+
+def format_metrics(metrics: dict[str, float]) -> str:
+    return (
+        f"total={metrics['total_loss']:.6f} "
+        f"supervised={metrics['supervised_loss']:.6f} "
+        f"mse={metrics['mse_loss']:.6f} "
+        f"bound={metrics['bound_penalty_loss']:.6f} "
+        f"recon={metrics['reconstruction_loss']:.6f} "
+        f"weighted_recon={metrics['weighted_reconstruction_loss']:.6f} "
+        f"recon_market={metrics['market_reconstruction_loss']:.6f} "
+        f"recon_demand={metrics['demand_reconstruction_loss']:.6f} "
+        f"recon_supply={metrics['supply_reconstruction_loss']:.6f} "
+        f"mae={metrics['mae']:.6f} "
+        f"low_mae={metrics['low_mae']:.6f} "
+        f"high_mae={metrics['high_mae']:.6f} "
+        f"order_violation={metrics['order_violation_rate']:.4%}"
+    )
+
+
 def main() -> None:
     args = parse_args()
+    if args.interval_weight is not None:
+        print(
+            "Warning: --interval-weight is deprecated; treating it as "
+            "--bound-penalty-weight."
+        )
+        args.bound_penalty_weight = args.interval_weight
+    validate_training_args(args)
     set_seed(args.seed)
     device = choose_device(args.device)
 
@@ -288,50 +450,159 @@ def main() -> None:
     )
     model = CopperIntervalPredictor(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    best_val_loss = float("inf")
+    selection_metric_name = f"val_{args.selection_metric}"
+    run_config = {
+        "arguments": serializable_args(args),
+        "model_config": asdict(model.config),
+        "device": str(device),
+        "data_split": {
+            "all": date_range_metadata(dates),
+            "train": date_range_metadata(train_dates),
+            "val": date_range_metadata(val_dates),
+            "test": date_range_metadata(test_dates),
+        },
+        "selection_metric": selection_metric_name,
+    }
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    save_run_config(args.output_dir / "training_config.json", run_config)
+    history: list[dict[str, float | int | bool | str]] = []
+    history_path = args.output_dir / "training_history.csv"
+    best_selection_value = float("inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
+
+    print(
+        "Loss weights: "
+        f"supervised={args.supervised_weight:g} "
+        f"bound_penalty={args.bound_penalty_weight:g} "
+        f"reconstruction={args.reconstruction_weight:g}"
+    )
+    print(f"Best-checkpoint metric: {selection_metric_name}")
+    if args.early_stopping_patience > 0:
+        print(
+            "Early stopping: "
+            f"patience={args.early_stopping_patience} "
+            f"min_delta={args.early_stopping_min_delta:g}"
+        )
+    else:
+        print("Early stopping: disabled")
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_mae = run_epoch(
+        train_metrics = run_epoch(
             model,
             train_loader,
             device,
-            args.interval_weight,
+            args.supervised_weight,
+            args.bound_penalty_weight,
             args.reconstruction_weight,
             optimizer,
         )
         with torch.no_grad():
-            val_loss, val_mae = run_epoch(
+            val_metrics = run_epoch(
                 model,
                 val_loader,
                 device,
-                args.interval_weight,
+                args.supervised_weight,
+                args.bound_penalty_weight,
                 args.reconstruction_weight,
             )
 
+        selection_value = val_metrics[args.selection_metric]
+        if not np.isfinite(selection_value):
+            raise RuntimeError(
+                f"{selection_metric_name} is not finite at epoch {epoch}: "
+                f"{selection_value}"
+            )
+        improved = selection_value < (
+            best_selection_value - args.early_stopping_min_delta
+        )
+        history.append(
+            history_row(
+                epoch,
+                train_metrics,
+                val_metrics,
+                selection_metric_name,
+                selection_value,
+                improved,
+            )
+        )
+        pd.DataFrame(history).to_csv(history_path, index=False)
+
+        save_checkpoint(
+            args.output_dir / "last_model.pt",
+            model,
+            epoch,
+            train_metrics,
+            val_metrics,
+            selection_metric_name,
+            selection_value,
+            run_config,
+        )
+        if improved:
+            best_selection_value = selection_value
+            best_epoch = epoch
+            epochs_without_improvement = 0
+            save_checkpoint(
+                args.output_dir / "best_model.pt",
+                model,
+                epoch,
+                train_metrics,
+                val_metrics,
+                selection_metric_name,
+                selection_value,
+                run_config,
+            )
+        else:
+            epochs_without_improvement += 1
+
+        print(f"epoch={epoch:03d} best={improved}")
+        print(f"  train {format_metrics(train_metrics)}")
+        print(f"  val   {format_metrics(val_metrics)}")
         print(
-            f"epoch={epoch:03d} "
-            f"train_loss={train_loss:.6f} train_mae={train_mae:.6f} "
-            f"val_loss={val_loss:.6f} val_mae={val_mae:.6f}"
+            f"  selection {selection_metric_name}={selection_value:.6f} "
+            f"best_epoch={best_epoch:03d} best_value={best_selection_value:.6f}"
         )
 
-        save_checkpoint(args.output_dir / "last_model.pt", model, epoch, train_loss, val_loss)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            save_checkpoint(args.output_dir / "best_model.pt", model, epoch, train_loss, val_loss)
+        if (
+            args.early_stopping_patience > 0
+            and epochs_without_improvement >= args.early_stopping_patience
+        ):
+            print(
+                f"Early stopping at epoch {epoch}: "
+                f"{selection_metric_name} did not improve by at least "
+                f"{args.early_stopping_min_delta:g} for "
+                f"{args.early_stopping_patience} epochs."
+            )
+            break
 
     if test_dates:
         checkpoint = torch.load(args.output_dir / "best_model.pt", map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         with torch.no_grad():
-            test_loss, test_mae = run_epoch(
+            test_metrics = run_epoch(
                 model,
                 test_loader,
                 device,
-                args.interval_weight,
+                args.supervised_weight,
+                args.bound_penalty_weight,
                 args.reconstruction_weight,
             )
-        print(f"test_loss={test_loss:.6f} test_mae={test_mae:.6f}")
-        save_checkpoint(args.output_dir / "best_model.pt", model, int(checkpoint["epoch"]), checkpoint["train_loss"], checkpoint["val_loss"], test_loss)
+        print(f"best_epoch={int(checkpoint['epoch']):03d}")
+        print(f"  test  {format_metrics(test_metrics)}")
+        save_checkpoint(
+            args.output_dir / "best_model.pt",
+            model,
+            int(checkpoint["epoch"]),
+            checkpoint["train_metrics"],
+            checkpoint["val_metrics"],
+            str(checkpoint["selection_metric"]),
+            float(checkpoint["selection_value"]),
+            run_config,
+            test_metrics=test_metrics,
+        )
+
+    print(f"Saved run config to {args.output_dir / 'training_config.json'}")
+    print(f"Saved training history to {history_path}")
 
 
 if __name__ == "__main__":

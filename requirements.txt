@@ -1,0 +1,6 @@
+numpy>=2.0
+pandas>=2.0
+scipy>=1.10
+torch>=2.2
+akshare>=1.18
+yfinance>=0.2

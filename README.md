@@ -119,7 +119,10 @@ PYTHONPATH=src .venv/bin/python scripts/train.py \
   --raw-dir data/raw \
   --output-dir outputs/models \
   --epochs 50 \
-  --batch-size 32
+  --batch-size 32 \
+  --reconstruction-weight 0.0005 \
+  --selection-metric mae \
+  --early-stopping-patience 12
 ```
 
 Outputs:
@@ -127,7 +130,26 @@ Outputs:
 ```text
 outputs/models/best_model.pt
 outputs/models/last_model.pt
+outputs/models/training_config.json
+outputs/models/training_history.csv
 ```
+
+`best_model.pt` is selected by validation prediction MAE by default. The CSV
+history records supervised MSE, bound penalty, each graph reconstruction loss,
+weighted losses, interval MAE, lower/upper-bound MAE, and order violations for
+both the training and validation splits.
+
+The loss weights have distinct meanings:
+
+```text
+total_loss =
+    supervised_weight * (mse_loss + bound_penalty_weight * bound_penalty_loss)
+    + reconstruction_weight * reconstruction_loss
+```
+
+Defaults are `supervised_weight=1`, `bound_penalty_weight=1`, and
+`reconstruction_weight=0.0005`. The legacy `--interval-weight` option remains
+accepted as an alias for `--bound-penalty-weight`.
 
 Useful debugging option:
 

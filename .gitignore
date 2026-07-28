@@ -1,0 +1,80 @@
+# macOS / Windows
+.DS_Store
+Thumbs.db
+
+# IDE and editor settings
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging and build artifacts
+build/
+dist/
+.eggs/
+*.egg
+*.egg-info/
+
+# Test and coverage reports
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Training outputs, experiment trackers, and model checkpoints
+outputs/
+checkpoints/
+runs/
+wandb/
+mlruns/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Locally collected market data (keep the directory structure in Git)
+data/raw/*
+!data/raw/.gitkeep
+!data/raw/README.md
+
+# Generated data caches (data/manifest.csv remains available to track)
+data/cache/
+data/interim/
+data/processed/
+
+# Locally stored third-party research papers
+/文献/
