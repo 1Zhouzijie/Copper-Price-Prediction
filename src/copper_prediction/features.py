@@ -145,23 +145,37 @@ def copper_cnn_features(copper_frame: pd.DataFrame) -> pd.DataFrame:
     return features.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 
-def build_cnn_matrix(copper_frame: pd.DataFrame, end_date: pd.Timestamp, window: int = CNN_WINDOW) -> np.ndarray:
-    """Return one CNN matrix with shape (10, window)."""
+def build_cnn_matrix_from_features(
+    feature_frame: pd.DataFrame,
+    end_date: pd.Timestamp,
+    window: int = CNN_WINDOW,
+) -> np.ndarray:
+    """Return one CNN matrix from a precomputed copper feature frame."""
 
-    features = copper_cnn_features(copper_frame)
-    matrix = _last_window(features, end_date, window).to_numpy(dtype=np.float32).T
+    matrix = _last_window(feature_frame, end_date, window).to_numpy(dtype=np.float32).T
     if matrix.shape != (CNN_FEATURE_DIM, window):
         raise ValueError(f"expected CNN matrix {(CNN_FEATURE_DIM, window)}, got {matrix.shape}")
     return matrix
 
 
-def _node_feature_frame(frame: pd.DataFrame, node: NodeSpec) -> pd.DataFrame:
+def build_cnn_matrix(copper_frame: pd.DataFrame, end_date: pd.Timestamp, window: int = CNN_WINDOW) -> np.ndarray:
+    """Return one CNN matrix with shape (10, window)."""
+
+    features = copper_cnn_features(copper_frame)
+    return build_cnn_matrix_from_features(features, end_date, window)
+
+
+def node_feature_frame(frame: pd.DataFrame, node: NodeSpec) -> pd.DataFrame:
+    """Build the complete feature frame for one graph node."""
+
     if node.node_type == "inventory":
         return inventory_features(frame)
     return financial_features(frame)
 
 
-def _node_return_series(frame: pd.DataFrame, node: NodeSpec) -> pd.Series:
+def node_return_series(frame: pd.DataFrame, node: NodeSpec) -> pd.Series:
+    """Build the complete return series used for graph correlations."""
+
     values = _value_series(frame.sort_index(), node.node_type)
     return values.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
@@ -201,27 +215,50 @@ def build_graph_inputs(
     close-like column; inventory frames need an inventory/stock/value column.
     """
 
-    node_features: list[np.ndarray] = []
+    feature_frames: dict[str, pd.DataFrame] = {}
     returns_by_node: dict[str, pd.Series] = {}
-
     for node in graph_spec.nodes:
         if node.name not in asset_frames:
             raise KeyError(f"missing data for node {node.name!r} in {graph_spec.name} graph")
         frame = asset_frames[node.name].sort_index()
-        feature_frame = _node_feature_frame(frame, node)
-        if end_date not in feature_frame.index:
-            feature_frame = feature_frame.reindex(feature_frame.index.union([end_date])).sort_index().ffill()
-        row = feature_frame.loc[:end_date].tail(1)
+        feature_frames[node.name] = node_feature_frame(frame, node)
+        returns_by_node[node.name] = node_return_series(frame, node)
+
+    graph_returns = pd.DataFrame(returns_by_node).sort_index()
+    return build_graph_inputs_from_precomputed(
+        feature_frames,
+        graph_returns,
+        graph_spec,
+        end_date,
+        corr_window,
+        top_k,
+    )
+
+
+def build_graph_inputs_from_precomputed(
+    feature_frames: Mapping[str, pd.DataFrame],
+    graph_returns: pd.DataFrame,
+    graph_spec: GraphSpec,
+    end_date: pd.Timestamp,
+    corr_window: int = CORR_WINDOW,
+    top_k: int = TOP_K_EDGES,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return graph inputs from feature frames and returns computed once."""
+
+    node_features: list[np.ndarray] = []
+    for node in graph_spec.nodes:
+        if node.name not in feature_frames:
+            raise KeyError(f"missing precomputed features for node {node.name!r}")
+        row = feature_frames[node.name].loc[:end_date].tail(1)
         if row.empty:
             raise ValueError(f"no features available for node {node.name!r} up to {end_date}")
         node_features.append(row.to_numpy(dtype=np.float32).reshape(-1))
-        returns_by_node[node.name] = _node_return_series(frame, node)
 
     x = np.vstack(node_features).astype(np.float32)
     if x.shape != (graph_spec.num_nodes, NODE_FEATURE_DIM):
         raise ValueError(f"expected node features {(graph_spec.num_nodes, NODE_FEATURE_DIM)}, got {x.shape}")
 
-    returns = pd.DataFrame(returns_by_node).sort_index().loc[:end_date].tail(corr_window)
+    returns = graph_returns.loc[:end_date].tail(corr_window)
     if len(returns) < corr_window:
         raise ValueError(f"need at least {corr_window} return rows up to {end_date}, got {len(returns)}")
     returns = returns.ffill().fillna(0.0)

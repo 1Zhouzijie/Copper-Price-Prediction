@@ -104,7 +104,7 @@ def valid_dates(
 
     valid: list[pd.Timestamp] = []
     failures: list[str] = []
-    for date in candidates:
+    for index, date in enumerate(candidates, start=1):
         try:
             builder.build(date)
         except Exception as exc:  # noqa: BLE001 - report and skip unusable dates
@@ -112,6 +112,8 @@ def valid_dates(
                 failures.append(f"{date.date()}: {exc}")
             continue
         valid.append(date)
+        if index == 1 or index % 50 == 0 or index == len(candidates):
+            print(f"Validated dates: {index}/{len(candidates)}")
 
     if failures:
         print("Skipped some dates that could not build samples:")

@@ -9,7 +9,14 @@ import numpy as np
 import pandas as pd
 
 from .config import GraphSpec, default_graph_specs
-from .features import build_cnn_matrix, build_graph_inputs, build_target
+from .features import (
+    build_cnn_matrix_from_features,
+    build_graph_inputs_from_precomputed,
+    build_target,
+    copper_cnn_features,
+    node_feature_frame,
+    node_return_series,
+)
 
 
 @dataclass(frozen=True)
@@ -45,27 +52,60 @@ class CopperGraphSampleBuilder:
         self.copper_frame = copper_frame.sort_index()
         self.asset_frames = asset_frames
         self.graph_specs = graph_specs or default_graph_specs()
+        self.cnn_feature_frame = copper_cnn_features(self.copper_frame)
+        self.node_feature_frames: dict[str, pd.DataFrame] = {}
+        self.node_return_series: dict[str, pd.Series] = {}
+        self.graph_return_frames: dict[str, pd.DataFrame] = {}
+        self._input_cache: dict[pd.Timestamp, CopperModelInputs] = {}
+        self._sample_cache: dict[pd.Timestamp, CopperSample] = {}
+
+        seen: set[str] = set()
+        for graph_spec in self.graph_specs.values():
+            for node in graph_spec.nodes:
+                if node.name in seen:
+                    continue
+                if node.name not in self.asset_frames:
+                    raise KeyError(f"missing data for node {node.name!r}")
+                frame = self.asset_frames[node.name].sort_index()
+                self.node_feature_frames[node.name] = node_feature_frame(frame, node)
+                self.node_return_series[node.name] = node_return_series(frame, node)
+                seen.add(node.name)
+
+        for graph_name, graph_spec in self.graph_specs.items():
+            self.graph_return_frames[graph_name] = pd.DataFrame(
+                {
+                    node.name: self.node_return_series[node.name]
+                    for node in graph_spec.nodes
+                }
+            ).sort_index()
 
     def build_inputs(self, date: pd.Timestamp) -> CopperModelInputs:
         date = pd.Timestamp(date)
-        market_adj, market_x = build_graph_inputs(
-            self.asset_frames,
+        cached = self._input_cache.get(date)
+        if cached is not None:
+            return cached
+
+        market_adj, market_x = build_graph_inputs_from_precomputed(
+            self.node_feature_frames,
+            self.graph_return_frames["market"],
             self.graph_specs["market"],
             date,
         )
-        demand_adj, demand_x = build_graph_inputs(
-            self.asset_frames,
+        demand_adj, demand_x = build_graph_inputs_from_precomputed(
+            self.node_feature_frames,
+            self.graph_return_frames["demand"],
             self.graph_specs["demand"],
             date,
         )
-        supply_adj, supply_x = build_graph_inputs(
-            self.asset_frames,
+        supply_adj, supply_x = build_graph_inputs_from_precomputed(
+            self.node_feature_frames,
+            self.graph_return_frames["supply"],
             self.graph_specs["supply"],
             date,
         )
-        return CopperModelInputs(
+        inputs = CopperModelInputs(
             date=date,
-            cnn_x=build_cnn_matrix(self.copper_frame, date),
+            cnn_x=build_cnn_matrix_from_features(self.cnn_feature_frame, date),
             market_x=market_x,
             market_adj=market_adj,
             demand_x=demand_x,
@@ -73,10 +113,17 @@ class CopperGraphSampleBuilder:
             supply_x=supply_x,
             supply_adj=supply_adj,
         )
+        self._input_cache[date] = inputs
+        return inputs
 
     def build(self, date: pd.Timestamp) -> CopperSample:
+        date = pd.Timestamp(date)
+        cached = self._sample_cache.get(date)
+        if cached is not None:
+            return cached
+
         inputs = self.build_inputs(date)
-        return CopperSample(
+        sample = CopperSample(
             date=inputs.date,
             cnn_x=inputs.cnn_x,
             market_x=inputs.market_x,
@@ -87,6 +134,8 @@ class CopperGraphSampleBuilder:
             supply_adj=inputs.supply_adj,
             target=build_target(self.copper_frame, inputs.date),
         )
+        self._sample_cache[date] = sample
+        return sample
 
 
 class TorchCopperDataset:

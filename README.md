@@ -163,3 +163,27 @@ pred_high_return
 pred_low_price
 pred_high_price
 ```
+
+## Evaluate
+
+Evaluate a checkpoint on the chronological test split and compare it with the
+previous realized interval and a 20-day rolling-mean baseline:
+
+```bash
+python scripts/evaluate.py \
+  --raw-dir data/raw \
+  --checkpoint outputs/models/gcn_concat_20230302_20251117/best_model.pt \
+  --start-date 20230302 \
+  --end-date 20251117 \
+  --split test \
+  --device auto
+```
+
+The evaluator reports return MAE/RMSE, price MAE, invalid interval rate,
+full-interval coverage, and improvement over the rolling baseline. Detailed
+outputs are saved beside the checkpoint under `evaluation/`:
+
+```text
+test_summary.csv
+test_predictions.csv
+```
